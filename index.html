@@ -1,0 +1,1778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Efforts Intelligence</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet"/>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/papaparse@5/papaparse.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body,#root{height:100%;font-family:'Inter',system-ui,sans-serif;background:#EEF1F8}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-thumb{background:#C5CFDF;border-radius:4px}
+::-webkit-scrollbar-track{background:transparent}
+input,select,button,textarea{font-family:'Inter',system-ui,sans-serif}
+button{cursor:pointer}
+
+/* ─── Design tokens ─── */
+:root{
+  --navy:#1B3068;--navy2:#243B80;--navy3:#0F1F45;
+  --orange:#F26522;--orange2:#E8571A;
+  --bg:#EEF1F8;--surface:#fff;--border:#E2E8F4;
+  --text:#1A2341;--muted:#7182A0;--hint:#B8C4D8;
+  --green:#16A34A;--green-bg:#ECFDF5;--green-bd:#BBF7D0;
+  --amber:#D97706;--amber-bg:#FFFBEB;--amber-bd:#FDE68A;
+  --red:#DC2626;--red-bg:#FEF2F2;--red-bd:#FECACA;
+  --blue:#2563EB;--blue-bg:#EFF6FF;--blue-bd:#BFDBFE;
+  --purple:#7C3AED;--purple-bg:#F5F3FF;
+  --shadow:0 1px 3px rgba(0,0,0,.08),0 4px 16px rgba(27,48,104,.06);
+  --shadow-md:0 4px 6px rgba(0,0,0,.06),0 8px 24px rgba(27,48,104,.1);
+  --r:10px;--r-sm:7px;
+}
+
+/* dark mode */
+.dark{
+  --bg:#0E1420;--surface:#162032;--border:#243040;
+  --text:#E2E8F4;--muted:#6B809A;--hint:#2A3A50;
+  --green-bg:#0A2218;--green-bd:#1A5C38;
+  --amber-bg:#1C1200;--amber-bd:#5C3A00;
+  --red-bg:#200A0A;--red-bd:#5C1A1A;
+  --blue-bg:#0A1628;--blue-bd:#1E3A5F;
+  --shadow:0 1px 4px rgba(0,0,0,.3),0 4px 16px rgba(0,0,0,.2);
+  --shadow-md:0 4px 8px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.25);
+}
+.dark .topbar{background:var(--navy3)!important}
+.dark .card{background:var(--surface)!important}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- §1 Pure Logic (no JSX) -->
+<script>
+// ─── 2. SHIFT CONSTANTS ───────────────────────────────────────────────────────
+// SHIFT_VALID: actual-call-based window (dead hours — only score worked hours)
+var SHIFT_VALID = {
+  ROW:          { set:new Set([10,11,12,13,14,15,16,17,18,19,20,21,22,23]), wraps:false },
+  "US Evening": { set:new Set([17,18,19,20,21,22,23,0,1,2,3,4,5]), wraps:true, lateMin:17, earlyMax:5 },
+  "US Night":   { set:new Set([20,21,22,23,0,1,2,3,4,5,6,7,8,9]), wraps:true, lateMin:20, earlyMax:9 },
+};
+// SHIFT_FULL_WINDOWS: complete expected shift range (anomaly detection — what they SHOULD have worked)
+var SHIFT_FULL_WINDOWS = {
+  ROW:          Array.from({length:14},(_,i)=>i+10),
+  "US Evening": [...Array.from({length:7},(_,i)=>i+17), ...Array.from({length:6},(_,i)=>i)],
+  "US Night":   [...Array.from({length:4},(_,i)=>i+20), ...Array.from({length:10},(_,i)=>i)],
+};
+var SHIFT_ORDER = { ROW:0, "US Evening":1, "US Night":2, Unknown:3 };
+
+// ─── 3. BSC CONSTANTS ─────────────────────────────────────────────────────────
+var CC_TARGET   = 21;    // Connects per day target
+var PTT_TARGET  = 145;   // Pure Talk Time minutes per day target
+var TTFA_SCORE  = 24.5;  // Fixed: 93% ÷ 95% × 25 = 24.47 ≈ 24.5 (operationally stable)
+var ABS_TTL     = 7 * 86400000; // 7-day absence persistence
+
+// ─── 4. PURE UTILITIES ────────────────────────────────────────────────────────
+
+// CRITICAL: use local date parts, never toISOString() which converts to UTC.
+// India IST (UTC+5:30): May 22 00:00 local = May 21 18:30 UTC → wrong date.
+function localYMD(d) {
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+function parseCSVDate(s) {
+  if (!s) return null;
+  const p = String(s).trim().split("/");
+  if (p.length === 3) return new Date(+p[2], +p[0]-1, +p[1]);
+  const d = new Date(s); return isNaN(d) ? null : d;
+}
+// 10 AM → 10 AM shift window rule: calls before 10 AM belong to previous shift day
+function toShiftDay(date, hour) {
+  const d = new Date(date.getTime());
+  if (hour < 10) d.setDate(d.getDate() - 1);
+  return localYMD(d);
+}
+function isAnomaly(date, hour, ut) {
+  const ts = new Date(date.getTime()); ts.setHours(hour, 0, 0, 0); return ts > ut;
+}
+// Shift detection from first call hour
+function classifyShift(h) {
+  if (h >= 10 && h < 17) return "ROW";
+  if (h >= 17 && h < 20) return "US Evening";
+  return "US Night";
+}
+function getFirstCallHour(hours) {
+  const late = hours.filter(h => h >= 10);
+  if (late.length) return Math.min(...late);
+  const early = hours.filter(h => h < 10);
+  return early.length ? Math.min(...early) : null;
+}
+function detectShiftForAdvisor(records) {
+  const dayHours = {};
+  for (const r of records) {
+    if (!dayHours[r.shiftDay]) dayHours[r.shiftDay] = [];
+    dayHours[r.shiftDay].push(r.hour);
+  }
+  const firstHours = Object.values(dayHours)
+    .map(hrs => getFirstCallHour(hrs)).filter(h => h !== null).sort((a,b) => a-b);
+  if (!firstHours.length) return "Unknown";
+  return classifyShift(firstHours[Math.floor(firstHours.length / 2)]);
+}
+// Dead hour window: only hours advisor actually worked (excludes buffer time)
+function computeWindow(shiftCat, uniqueHours) {
+  const def = SHIFT_VALID[shiftCat];
+  if (!def) return uniqueHours.sort((a,b) => a-b);
+  const valid = uniqueHours.filter(h => def.set.has(h));
+  if (!valid.length) return [];
+  if (!def.wraps) {
+    const mn = Math.min(...valid), mx = Math.max(...valid);
+    return Array.from({length: mx-mn+1}, (_,i) => i+mn);
+  }
+  const late = valid.filter(h => h >= def.lateMin).sort((a,b) => a-b);
+  const early = valid.filter(h => h <= def.earlyMax).sort((a,b) => a-b);
+  const res = [];
+  if (late.length) for (let h = late[0]; h <= (early.length ? 23 : late[late.length-1]); h++) res.push(h);
+  if (early.length) for (let h = 0; h <= early[early.length-1]; h++) res.push(h);
+  return [...new Set(res)];
+}
+function effortScore(d, c, p) { return (d>=10?1:0)+(c>=2?1:0)+(p>=15?1:0); }
+function absKey(a, d) { return `${a}___${d}`; }
+function isAbsent(a, d, absences) {
+  const ab = absences[absKey(a, d)];
+  return !!(ab && Date.now() - ab.ts < ABS_TTL);
+}
+function fmtDate(iso) {
+  if (!iso) return "—";
+  return new Date(iso + "T00:00:00").toLocaleDateString("en-IN", {day:"2-digit", month:"short"});
+}
+function fmtUpload(dt) {
+  return dt.toLocaleString("en-IN", {day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit", hour12:true});
+}
+function fmtPTT(m) { return m ? m.toFixed(1) : "0.0"; }
+function sortByShiftCat(a, b) {
+  const so = (SHIFT_ORDER[a.shiftCategory ?? a.shiftCat] ?? 3) - (SHIFT_ORDER[b.shiftCategory ?? b.shiftCat] ?? 3);
+  return so !== 0 ? so : (a.advisor ?? "").localeCompare(b.advisor ?? "");
+}
+
+// ─── 5. BSC PROJECTION ENGINE ─────────────────────────────────────────────────
+// Model: CC (25pts) + PTT (25pts) + AHT_inferred (25pts) + TTFA_fixed (24.5pts)
+// AHT cannot be measured directly (follow-up calls contaminate the average).
+// We infer AHT probability from PTT-per-connect. Higher = better, no upper penalty.
+// Verified examples: 150 PTT+15 conn→88.3, 175 PTT+18 conn→91.9, 100 PTT+15 conn→75.5
+
+function inferAHTProb(pttPerCall) {
+  if (pttPerCall <= 0) return 0.05;
+  if (pttPerCall >= 13) return 0.93;
+  // Piecewise linear interpolation between calibrated thresholds
+  const steps = [[0,0.05],[2,0.25],[4,0.42],[6,0.60],[8,0.75],[10,0.85],[13,0.93]];
+  for (let i = 1; i < steps.length; i++) {
+    const [x0, y0] = steps[i-1], [x1, y1] = steps[i];
+    if (pttPerCall <= x1) return y0 + (pttPerCall - x0) / (x1 - x0) * (y1 - y0);
+  }
+  return 0.93;
+}
+
+function projectBSCDay(advisor, shiftDay, dayRecs, shiftCat, totalDaysInFile) {
+  const dials     = dayRecs.length;
+  const connected = dayRecs.reduce((s,r) => s + r.connected, 0);
+  const ptt       = dayRecs.reduce((s,r) => s + r.ptt, 0);
+  const pttPerCall = connected > 0 ? ptt / connected : 0;
+
+  // Direct measurements (exact)
+  const ccScore  = Math.min(connected / CC_TARGET,  1.0) * 25;
+  const pttScore = Math.min(ptt      / PTT_TARGET, 1.0) * 25;
+
+  // Inferred (probabilistic — main source of uncertainty)
+  const ahtProb  = inferAHTProb(pttPerCall);
+  const ahtScore = ahtProb * 25;
+
+  // Fixed operational baseline
+  const ttfaScore = TTFA_SCORE;
+
+  const bsc = ccScore + pttScore + ahtScore + ttfaScore;
+
+  // Uncertainty narrows with more days of data
+  const unc  = totalDaysInFile >= 5 ? 2 : totalDaysInFile >= 3 ? 3 : 5;
+  const lo   = +(Math.max(0,   bsc - unc)).toFixed(1);
+  const hi   = +(Math.min(100, bsc + unc)).toFixed(1);
+
+  // Confidence: how certain is the projection?
+  const baseConf = totalDaysInFile >= 5 ? 87 : totalDaysInFile >= 3 ? 78 : totalDaysInFile >= 2 ? 68 : 58;
+  const dataQ    = dials > 60 && connected > 10 ? 5 : dials > 30 ? 2 : 0;
+  const conf     = Math.min(baseConf + dataQ, 94);
+
+  // Qualification probability: P(BSC ≥ 60 by quarter end)
+  const qualProb = bsc>=82?93 : bsc>=74?82 : bsc>=66?68 : bsc>=60?52 : bsc>=52?30 : 12;
+
+  // Risk / Strength signals
+  const risks = [], strengths = [];
+  if (connected < 10)      risks.push("Very Low Connects");
+  else if (connected < 14) risks.push("Low Connect Volume");
+  if (ptt < 60)            risks.push("Low PTT");
+  if (pttPerCall < 4)      risks.push("Very Short Calls — Possible Mis-dials");
+  if (ccScore >= 24)       strengths.push("Connects On/Above Target");
+  if (pttScore >= 24)      strengths.push("PTT On/Above Target");
+  if (ahtProb >= 0.82)     strengths.push(`Strong Engagement (${pttPerCall.toFixed(1)} min/call)`);
+
+  const kra = [
+    { label:"CC",   score:+ccScore.toFixed(1),   pct:+Math.min(connected/CC_TARGET*100,100).toFixed(0) },
+    { label:"PTT",  score:+pttScore.toFixed(1),  pct:+Math.min(ptt/PTT_TARGET*100,100).toFixed(0) },
+    { label:"AHT",  score:+ahtScore.toFixed(1),  pct:+(ahtProb*100).toFixed(0) },
+    { label:"TTFA", score:+ttfaScore.toFixed(1), pct:93 },
+  ];
+
+  return {
+    advisor, shiftDay, shiftCat, dials, connected,
+    ptt: +ptt.toFixed(1), pttPerCall: +pttPerCall.toFixed(1),
+    bsc: +bsc.toFixed(2), lo, hi, conf, qualProb, kra,
+    eligibleBSC: bsc >= 60,
+    slabHint: bsc>=90?"Top Slab (1–7)" : bsc>=78?"Mid-Upper" : bsc>=60?"Lower Slab" : "Below Gate",
+    mainRisk:     risks[0]    || "Within Normal Range",
+    mainStrength: strengths[0] || "Balanced Profile",
+  };
+}
+
+// ─── 6. ANOMALY DETECTION ENGINE ──────────────────────────────────────────────
+// All 6 rules applied uniformly to every advisor. Transparent reasons shown.
+
+// Ghost Login: ≤2 dials in first call hour + 2+ consecutive zero-dial hours
+// immediately after (mid-shift gaps ignored — could be technical/emergency)
+function detectGhostLogin(aggRow) {
+  const { dials, hourScores, shiftCategory } = aggRow;
+  if (!dials) return { detected: false };
+  const full = SHIFT_FULL_WINDOWS[shiftCategory] || Array.from({length:24},(_,i)=>i);
+  const gd = h => hourScores[h]?.d || 0;
+  const firstH = full.find(h => gd(h) > 0);
+  if (firstH === undefined) return { detected: false };
+  const fhd = gd(firstH);
+  if (fhd > 2) return { detected: false };
+  const idx = full.indexOf(firstH);
+  let gap = 0;
+  for (let i = idx+1; i < full.length; i++) {
+    if (gd(full[i]) === 0) { gap++; if (gap >= 2) return { detected:true, fhd, gap }; }
+    else break;
+  }
+  return { detected: false };
+}
+
+function evaluateAnomalies(aggRow, history) {
+  const { dials, connected, ptt } = aggRow;
+  const findings = [];
+  const pttPerCall = connected > 0 ? ptt / connected : 0;
+
+  // Rule 1: Near-Zero Activity (catches 1-dial advisors like Nandita, Samson)
+  if (dials > 0 && dials < 5) {
+    findings.push({ severity:"CRITICAL", label:"Near-Zero Activity",
+      reason:`Only ${dials} dial${dials>1?"s":""} recorded — effectively absent` });
+  }
+  // Rule 2: Below Productive Day (catches low-effort like Shubhi at 15 dials)
+  if (dials >= 5 && dials < 20) {
+    findings.push({ severity:"HIGH", label:"Below Productive Day",
+      reason:`${dials} dials — below the 20-dial productive day threshold` });
+  }
+  // Rule 3: Zero Connected Calls despite meaningful dial activity
+  if (dials >= 5 && connected === 0) {
+    findings.push({ severity:"HIGH", label:"Zero Connected Calls",
+      reason:`${dials} dials placed but 0 calls connected — possible mis-dialling` });
+  }
+  // Rule 4: Ghost Login pattern
+  if (dials > 0 && dials < 30) {
+    const g = detectGhostLogin(aggRow);
+    if (g.detected) {
+      findings.push({ severity:"CRITICAL", label:"Ghost Login",
+        reason:`${g.fhd} dial${g.fhd>1?"s":""} in first hour, then ${g.gap}h consecutive silence` });
+    }
+  }
+  // Rule 5: Very short calls (likely dropped or mis-dialled)
+  if (connected > 1 && pttPerCall > 0 && pttPerCall < 2) {
+    findings.push({ severity:"MEDIUM", label:"Very Short Calls",
+      reason:`Avg ${pttPerCall.toFixed(1)} min/call — possible call drops or mis-dials` });
+  }
+  // Rule 6: Significant drop vs own historical average
+  if (history && history.avgDials >= 20 && dials < history.avgDials * 0.45) {
+    const pct = Math.round(dials / history.avgDials * 100);
+    findings.push({ severity:"MEDIUM", label:"Drop vs History",
+      reason:`${dials} dials vs usual avg ${Math.round(history.avgDials)} — only ${pct}% of normal` });
+  }
+
+  const severity = findings.some(f => f.severity==="CRITICAL") ? "CRITICAL"
+                 : findings.some(f => f.severity==="HIGH")     ? "HIGH"
+                 : findings.length                              ? "MEDIUM" : null;
+  return { findings, severity, flagged: findings.length > 0 };
+}
+
+// ─── 7. CSV PROCESSING ────────────────────────────────────────────────────────
+function processCSV(rows, uploadTime) {
+  return rows.reduce((acc, row) => {
+    const advisor   = (row["Assigned"] || row["Advisor"] || "").trim();
+    const hour      = parseInt(row["Dialer Call Hour Of Day (Agent)"]) || 0;
+    const connected = parseInt(row["Dialer Call Connected?"]) || 0;
+    const duration  = parseFloat(row["Dialer Duration (min)"]) || 0;
+    const date      = parseCSVDate(row["Created Date"]);
+    if (!advisor || !date) return acc;
+    acc.push({
+      advisor, hour, connected, duration,
+      ptt: connected === 1 ? duration : 0,
+      shiftDay: toShiftDay(date, hour),
+      anomaly: isAnomaly(date, hour, uploadTime),
+      createdDate: date,
+    });
+    return acc;
+  }, []);
+}
+
+function buildAggregates(records) {
+  const allAdvRecs = {};
+  for (const r of records) {
+    if (!r.anomaly) {
+      if (!allAdvRecs[r.advisor]) allAdvRecs[r.advisor] = [];
+      allAdvRecs[r.advisor].push(r);
+    }
+  }
+  const shiftMap = {};
+  for (const [adv, recs] of Object.entries(allAdvRecs)) {
+    shiftMap[adv] = detectShiftForAdvisor(recs);
+  }
+  const groups = {};
+  for (const r of records) {
+    if (r.anomaly) continue;
+    const k = `${r.advisor}|||${r.shiftDay}`;
+    if (!groups[k]) groups[k] = { advisor: r.advisor, shiftDay: r.shiftDay, recs: [] };
+    groups[k].recs.push(r);
+  }
+  return Object.values(groups).map(g => {
+    const { advisor, shiftDay, recs } = g;
+    const shiftCategory = shiftMap[advisor] || "Unknown";
+    const dials     = recs.length;
+    const connected = recs.reduce((s,r) => s + r.connected, 0);
+    const ptt       = recs.reduce((s,r) => s + r.ptt, 0);
+    const hourMap   = {};
+    for (const r of recs) {
+      if (!hourMap[r.hour]) hourMap[r.hour] = { d:0, c:0, p:0 };
+      hourMap[r.hour].d++; hourMap[r.hour].c += r.connected; hourMap[r.hour].p += r.ptt;
+    }
+    const uniqueHours = Object.keys(hourMap).map(Number);
+    const windowHours = computeWindow(shiftCategory, uniqueHours);
+    const hourScores  = {};
+    let deadCount = 0;
+    for (let h = 0; h <= 23; h++) {
+      const inW = windowHours.includes(h);
+      if (inW) {
+        const hd = hourMap[h] || { d:0, c:0, p:0 };
+        const sc = effortScore(hd.d, hd.c, hd.p);
+        hourScores[h] = { ...hd, score: sc, inWindow: true };
+        if (sc === 0) deadCount++;
+      } else {
+        hourScores[h] = { d:0, c:0, p:0, score: null, inWindow: false };
+      }
+    }
+    const activeCount   = windowHours.length - deadCount;
+    const avgScore      = windowHours.length
+      ? windowHours.reduce((s,h) => s + (hourScores[h]?.score || 0), 0) / windowHours.length : 0;
+    const crossMidnight = recs.filter(r => localYMD(r.createdDate) !== shiftDay).length;
+    return { advisor, shiftDay, dials, connected, ptt, shiftCategory,
+             windowHours, hourScores, deadCount, activeCount, avgScore, crossMidnight };
+  });
+}
+
+// ─── 8. EXPORT ENGINE ─────────────────────────────────────────────────────────
+function prepareExportRows(data, shiftFilter, absences) {
+  const filtered = (shiftFilter === "all" ? data : data.filter(d => d.shiftDay === shiftFilter))
+    .filter(d => !isAbsent(d.advisor, d.shiftDay, absences));
+  const map = {};
+  for (const d of filtered) {
+    if (!map[d.advisor]) map[d.advisor] = { advisor: d.advisor, dials:0, connected:0, ptt:0 };
+    map[d.advisor].dials     += d.dials;
+    map[d.advisor].connected += d.connected;
+    map[d.advisor].ptt       += d.ptt;
+  }
+  const rows = Object.values(map).sort((a,b) => b.ptt - a.ptt).map(r => ({
+    advisor:  r.advisor,
+    dials:    r.dials,
+    connected: r.connected,
+    ptt:      +r.ptt.toFixed(2),
+    connRate: r.dials > 0 ? +((r.connected / r.dials) * 100).toFixed(2) : 0,
+    avgTalk:  r.connected > 0 ? +(r.ptt / r.connected).toFixed(2) : 0,
+  }));
+  const tot = rows.reduce((t,r) => ({ dials: t.dials+r.dials, connected: t.connected+r.connected, ptt: t.ptt+r.ptt }), {dials:0,connected:0,ptt:0});
+  return {
+    rows,
+    totals: { ...tot, ptt:+tot.ptt.toFixed(2),
+      connRate: tot.dials>0 ? +((tot.connected/tot.dials)*100).toFixed(2) : 0,
+      avgTalk:  tot.connected>0 ? +(tot.ptt/tot.connected).toFixed(2) : 0 },
+  };
+}
+
+function getExportLabel(shiftFilter, data) {
+  if (shiftFilter === "all") {
+    const days = [...new Set(data.map(d => d.shiftDay))].sort();
+    return days.length === 1 ? fmtDate(days[0]) : `${fmtDate(days[0])} – ${fmtDate(days[days.length-1])}`;
+  }
+  return fmtDate(shiftFilter);
+}
+
+// Shared HTML table for Excel download, clipboard copy, and PDF — exact sample format
+function buildReportHTML(rows, totals, label) {
+  const NAVY = "#1F3864";
+  const BLUE = "#9DC3E6";
+  const hdrTD = (txt, align="center") =>
+    `<td style="background:${NAVY};color:white;font-family:Cambria;font-size:9pt;font-weight:bold;padding:7px 10px;text-align:${align};border:2px solid ${NAVY};">${txt}</td>`;
+  const nameTD = (txt, bg="white") =>
+    `<td style="background:${bg};font-family:Cambria;font-size:9pt;padding:6px 10px;text-align:left;border-top:1px solid ${BLUE};border-bottom:1px solid ${BLUE};border-left:1px solid #000;border-right:2px solid ${BLUE};">${txt}</td>`;
+  const dataTD = (txt, bg="white") =>
+    `<td style="background:${bg};font-family:Cambria;font-size:9pt;padding:6px 10px;text-align:center;border:1px solid #000000;">${txt}</td>`;
+  const totTD = (txt, align="center") =>
+    `<td style="background:${NAVY};color:white;font-family:Cambria;font-size:9pt;font-weight:bold;padding:7px 10px;text-align:${align};border:2px solid ${NAVY};">${txt}</td>`;
+
+  const dataRows = rows.map((r, i) => {
+    const bg = i % 2 === 1 ? "#EEF4FB" : "white";
+    return `<tr>
+      ${nameTD(r.advisor, bg)}
+      ${dataTD(r.dials, bg)}
+      ${dataTD(r.connected, bg)}
+      ${dataTD(r.ptt.toFixed(2), bg)}
+      ${dataTD(r.connRate.toFixed(2)+"%", bg)}
+      ${dataTD(r.avgTalk.toFixed(2), bg)}
+    </tr>`;
+  }).join("");
+
+  return `<table style="border-collapse:collapse;font-family:Cambria;font-size:9pt;">
+    <tr><td colspan="6" style="background:${NAVY};color:white;font-family:Cambria;font-size:10pt;font-weight:bold;padding:8px 10px;border:1px solid ${NAVY};">&#128203; Team Effort Summary</td></tr>
+    <tr><td colspan="6" style="background:${NAVY};color:white;font-family:Cambria;font-size:9pt;padding:6px 10px;border:1px solid ${NAVY};">&#128197; Shift Date: ${label}</td></tr>
+    <tr>
+      ${hdrTD("Advisor","left")}
+      ${hdrTD("Total Calls")}
+      ${hdrTD("Connected Calls")}
+      ${hdrTD("Talk Time (min)")}
+      ${hdrTD("Conn Rate %")}
+      ${hdrTD("Avg Talk/Connect")}
+    </tr>
+    ${dataRows}
+    <tr>
+      ${totTD("Grand Total","left")}
+      ${totTD(totals.dials)}
+      ${totTD(totals.connected)}
+      ${totTD(totals.ptt.toFixed(2))}
+      ${totTD(totals.connRate.toFixed(2)+"%")}
+      ${totTD(totals.avgTalk.toFixed(2))}
+    </tr>
+  </table>`;
+}
+
+// Excel download — HTML with MS Office XML namespace (renders colors/fonts in Excel)
+function doExcelExport(data, shiftFilter, absences) {
+  const { rows, totals } = prepareExportRows(data, shiftFilter, absences);
+  const label = getExportLabel(shiftFilter, data);
+  const tableHTML = buildReportHTML(rows, totals, label);
+  const full = `<html xmlns:o="urn:schemas-microsoft-com:office:office"
+    xmlns:x="urn:schemas-microsoft-com:office:excel"
+    xmlns="http://www.w3.org/TR/REC-html40">
+  <head><meta charset="UTF-8">
+    <!--[if gte mso 9]><xml>
+      <x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet>
+        <x:Name>Effort Summary</x:Name>
+        <x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>
+      </x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook>
+    </xml><![endif]-->
+    <style>td,th{mso-number-format:General;}</style>
+  </head><body>${tableHTML}</body></html>`;
+  const blob = new Blob([full], { type: "application/vnd.ms-excel;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `Team_Effort_${label.replace(/[^a-zA-Z0-9]/g,"_")}.xls`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
+}
+
+// Copy to Excel — HTML clipboard (pastes with formatting into Excel)
+async function doCopyExcel(data, shiftFilter, absences, setCopied, sortedRows) {
+  const label = getExportLabel(shiftFilter, data);
+  let exportRows, totals;
+  if (sortedRows && sortedRows.length) {
+    const visible = sortedRows.filter(r => !isAbsent(r.advisor, r.shiftDay, absences));
+    exportRows = visible.map(r => ({
+      advisor: r.advisor, dials: r.dials, connected: r.connected,
+      ptt: +r.ptt.toFixed(2),
+      connRate: r.dials>0 ? +((r.connected/r.dials)*100).toFixed(2) : 0,
+      avgTalk: r.connected>0 ? +(r.ptt/r.connected).toFixed(2) : 0,
+    }));
+    const t = exportRows.reduce((s,r) => ({dials:s.dials+r.dials,connected:s.connected+r.connected,ptt:s.ptt+r.ptt}),{dials:0,connected:0,ptt:0});
+    totals = { ...t, ptt:+t.ptt.toFixed(2), connRate:t.dials>0?+((t.connected/t.dials)*100).toFixed(2):0, avgTalk:t.connected>0?+(t.ptt/t.connected).toFixed(2):0 };
+  } else {
+    const res = prepareExportRows(data, shiftFilter, absences);
+    exportRows = res.rows; totals = res.totals;
+  }
+  const htmlTable = buildReportHTML(exportRows, totals, label);
+  const tsv = [
+    "Team Effort Summary",
+    `Shift Date: ${label}`,
+    "",
+    "Advisor\tTotal Calls\tConnected Calls\tTalk Time (min)\tConn Rate %\tAvg Talk/Connect",
+    ...exportRows.map(r => `${r.advisor}\t${r.dials}\t${r.connected}\t${r.ptt}\t${r.connRate}%\t${r.avgTalk}`),
+    `Grand Total\t${totals.dials}\t${totals.connected}\t${totals.ptt}\t${totals.connRate}%\t${totals.avgTalk}`,
+  ].join("\n");
+  try {
+    if (typeof ClipboardItem !== "undefined") {
+      await navigator.clipboard.write([new ClipboardItem({
+        "text/html":  new Blob([htmlTable], { type:"text/html" }),
+        "text/plain": new Blob([tsv],       { type:"text/plain" }),
+      })]);
+    } else {
+      await navigator.clipboard.writeText(tsv);
+    }
+    setCopied(true); setTimeout(() => setCopied(false), 2500);
+  } catch {
+    try { await navigator.clipboard.writeText(tsv); setCopied(true); setTimeout(() => setCopied(false), 2500); }
+    catch (e) { console.error("Copy failed:", e); }
+  }
+}
+
+// PDF export — inject print CSS into page (window.open blocked in iframes)
+function doPDF(data, shiftFilter, absences) {
+  const { rows, totals } = prepareExportRows(data, shiftFilter, absences);
+  const label = getExportLabel(shiftFilter, data);
+  const tableHTML = buildReportHTML(rows, totals, label);
+  const PID = "eff-print", SID = "eff-print-css";
+  document.getElementById(PID)?.remove();
+  document.getElementById(SID)?.remove();
+  const div = document.createElement("div");
+  div.id = PID;
+  div.innerHTML = `<div style="background:white;padding:16px;font-family:Segoe UI,Arial,sans-serif;">
+    ${tableHTML}
+    <p style="margin-top:14px;font-size:8pt;color:#999;">Generated: ${new Date().toLocaleString("en-IN")} · Efforts Intelligence Dashboard</p>
+  </div>`;
+  document.body.appendChild(div);
+  const style = document.createElement("style");
+  style.id = SID;
+  style.textContent = `@media print{body>*:not(#${PID}){display:none!important}#${PID}{display:block!important;position:fixed;top:0;left:0;width:100%;background:white}@page{margin:12mm;size:A4 landscape}}#${PID}{display:none}`;
+  document.head.appendChild(style);
+  setTimeout(() => {
+    window.print();
+    setTimeout(() => { document.getElementById(PID)?.remove(); document.getElementById(SID)?.remove(); }, 3000);
+  }, 200);
+}
+
+
+
+// ─── 8. EXPORT ENGINE ─────────────────────────────────────────────────────────
+function prepareExportRows(data, shiftFilter, absences) {
+  const filtered = (shiftFilter === "all" ? data : data.filter(d => d.shiftDay === shiftFilter))
+    .filter(d => !isAbsent(d.advisor, d.shiftDay, absences));
+  const map = {};
+  for (const d of filtered) {
+    if (!map[d.advisor]) map[d.advisor] = { advisor: d.advisor, dials:0, connected:0, ptt:0 };
+    map[d.advisor].dials     += d.dials;
+    map[d.advisor].connected += d.connected;
+    map[d.advisor].ptt       += d.ptt;
+  }
+  const rows = Object.values(map).sort((a,b) => b.ptt - a.ptt).map(r => ({
+    advisor:  r.advisor,
+    dials:    r.dials,
+    connected: r.connected,
+    ptt:      +r.ptt.toFixed(2),
+    connRate: r.dials > 0 ? +((r.connected / r.dials) * 100).toFixed(2) : 0,
+    avgTalk:  r.connected > 0 ? +(r.ptt / r.connected).toFixed(2) : 0,
+  }));
+  const tot = rows.reduce((t,r) => ({ dials: t.dials+r.dials, connected: t.connected+r.connected, ptt: t.ptt+r.ptt }), {dials:0,connected:0,ptt:0});
+  return {
+    rows,
+    totals: { ...tot, ptt:+tot.ptt.toFixed(2),
+      connRate: tot.dials>0 ? +((tot.connected/tot.dials)*100).toFixed(2) : 0,
+      avgTalk:  tot.connected>0 ? +(tot.ptt/tot.connected).toFixed(2) : 0 },
+  };
+}
+
+function getExportLabel(shiftFilter, data) {
+  if (shiftFilter === "all") {
+    const days = [...new Set(data.map(d => d.shiftDay))].sort();
+    return days.length === 1 ? fmtDate(days[0]) : `${fmtDate(days[0])} – ${fmtDate(days[days.length-1])}`;
+  }
+  return fmtDate(shiftFilter);
+}
+
+// Shared HTML table for Excel download, clipboard copy, and PDF — exact sample format
+function buildReportHTML(rows, totals, label) {
+  const NAVY = "#1F3864";
+  const BLUE = "#9DC3E6";
+  const hdrTD = (txt, align="center") =>
+    `<td style="background:${NAVY};color:white;font-family:Cambria;font-size:9pt;font-weight:bold;padding:7px 10px;text-align:${align};border:2px solid ${NAVY};">${txt}</td>`;
+  const nameTD = (txt, bg="white") =>
+    `<td style="background:${bg};font-family:Cambria;font-size:9pt;padding:6px 10px;text-align:left;border-top:1px solid ${BLUE};border-bottom:1px solid ${BLUE};border-left:1px solid #000;border-right:2px solid ${BLUE};">${txt}</td>`;
+  const dataTD = (txt, bg="white") =>
+    `<td style="background:${bg};font-family:Cambria;font-size:9pt;padding:6px 10px;text-align:center;border:1px solid #000000;">${txt}</td>`;
+  const totTD = (txt, align="center") =>
+    `<td style="background:${NAVY};color:white;font-family:Cambria;font-size:9pt;font-weight:bold;padding:7px 10px;text-align:${align};border:2px solid ${NAVY};">${txt}</td>`;
+
+  const dataRows = rows.map((r, i) => {
+    const bg = i % 2 === 1 ? "#EEF4FB" : "white";
+    return `<tr>
+      ${nameTD(r.advisor, bg)}
+      ${dataTD(r.dials, bg)}
+      ${dataTD(r.connected, bg)}
+      ${dataTD(r.ptt.toFixed(2), bg)}
+      ${dataTD(r.connRate.toFixed(2)+"%", bg)}
+      ${dataTD(r.avgTalk.toFixed(2), bg)}
+    </tr>`;
+  }).join("");
+
+  return `<table style="border-collapse:collapse;font-family:Cambria;font-size:9pt;">
+    <tr><td colspan="6" style="background:${NAVY};color:white;font-family:Cambria;font-size:10pt;font-weight:bold;padding:8px 10px;border:1px solid ${NAVY};">&#128203; Team Effort Summary</td></tr>
+    <tr><td colspan="6" style="background:${NAVY};color:white;font-family:Cambria;font-size:9pt;padding:6px 10px;border:1px solid ${NAVY};">&#128197; Shift Date: ${label}</td></tr>
+    <tr>
+      ${hdrTD("Advisor","left")}
+      ${hdrTD("Total Calls")}
+      ${hdrTD("Connected Calls")}
+      ${hdrTD("Talk Time (min)")}
+      ${hdrTD("Conn Rate %")}
+      ${hdrTD("Avg Talk/Connect")}
+    </tr>
+    ${dataRows}
+    <tr>
+      ${totTD("Grand Total","left")}
+      ${totTD(totals.dials)}
+      ${totTD(totals.connected)}
+      ${totTD(totals.ptt.toFixed(2))}
+      ${totTD(totals.connRate.toFixed(2)+"%")}
+      ${totTD(totals.avgTalk.toFixed(2))}
+    </tr>
+  </table>`;
+}
+
+// Excel download — HTML with MS Office XML namespace (renders colors/fonts in Excel)
+function doExcelExport(data, shiftFilter, absences) {
+  const { rows, totals } = prepareExportRows(data, shiftFilter, absences);
+  const label = getExportLabel(shiftFilter, data);
+  const tableHTML = buildReportHTML(rows, totals, label);
+  const full = `<html xmlns:o="urn:schemas-microsoft-com:office:office"
+    xmlns:x="urn:schemas-microsoft-com:office:excel"
+    xmlns="http://www.w3.org/TR/REC-html40">
+  <head><meta charset="UTF-8">
+    <!--[if gte mso 9]><xml>
+      <x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet>
+        <x:Name>Effort Summary</x:Name>
+        <x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>
+      </x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook>
+    </xml><![endif]-->
+    <style>td,th{mso-number-format:General;}</style>
+  </head><body>${tableHTML}</body></html>`;
+  const blob = new Blob([full], { type: "application/vnd.ms-excel;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `Team_Effort_${label.replace(/[^a-zA-Z0-9]/g,"_")}.xls`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
+}
+
+// Copy to Excel — HTML clipboard (pastes with formatting into Excel)
+async function doCopyExcel(data, shiftFilter, absences, setCopied, sortedRows) {
+  const label = getExportLabel(shiftFilter, data);
+  let exportRows, totals;
+  if (sortedRows && sortedRows.length) {
+    const visible = sortedRows.filter(r => !isAbsent(r.advisor, r.shiftDay, absences));
+    exportRows = visible.map(r => ({
+      advisor: r.advisor, dials: r.dials, connected: r.connected,
+      ptt: +r.ptt.toFixed(2),
+      connRate: r.dials>0 ? +((r.connected/r.dials)*100).toFixed(2) : 0,
+      avgTalk: r.connected>0 ? +(r.ptt/r.connected).toFixed(2) : 0,
+    }));
+    const t = exportRows.reduce((s,r) => ({dials:s.dials+r.dials,connected:s.connected+r.connected,ptt:s.ptt+r.ptt}),{dials:0,connected:0,ptt:0});
+    totals = { ...t, ptt:+t.ptt.toFixed(2), connRate:t.dials>0?+((t.connected/t.dials)*100).toFixed(2):0, avgTalk:t.connected>0?+(t.ptt/t.connected).toFixed(2):0 };
+  } else {
+    const res = prepareExportRows(data, shiftFilter, absences);
+    exportRows = res.rows; totals = res.totals;
+  }
+  const htmlTable = buildReportHTML(exportRows, totals, label);
+  const tsv = [
+    "Team Effort Summary",
+    `Shift Date: ${label}`,
+    "",
+    "Advisor\tTotal Calls\tConnected Calls\tTalk Time (min)\tConn Rate %\tAvg Talk/Connect",
+    ...exportRows.map(r => `${r.advisor}\t${r.dials}\t${r.connected}\t${r.ptt}\t${r.connRate}%\t${r.avgTalk}`),
+    `Grand Total\t${totals.dials}\t${totals.connected}\t${totals.ptt}\t${totals.connRate}%\t${totals.avgTalk}`,
+  ].join("\n");
+  try {
+    if (typeof ClipboardItem !== "undefined") {
+      await navigator.clipboard.write([new ClipboardItem({
+        "text/html":  new Blob([htmlTable], { type:"text/html" }),
+        "text/plain": new Blob([tsv],       { type:"text/plain" }),
+      })]);
+    } else {
+      await navigator.clipboard.writeText(tsv);
+    }
+    setCopied(true); setTimeout(() => setCopied(false), 2500);
+  } catch {
+    try { await navigator.clipboard.writeText(tsv); setCopied(true); setTimeout(() => setCopied(false), 2500); }
+    catch (e) { console.error("Copy failed:", e); }
+  }
+}
+
+// PDF export — inject print CSS into page (window.open blocked in iframes)
+function doPDF(data, shiftFilter, absences) {
+  const { rows, totals } = prepareExportRows(data, shiftFilter, absences);
+  const label = getExportLabel(shiftFilter, data);
+  const tableHTML = buildReportHTML(rows, totals, label);
+  const PID = "eff-print", SID = "eff-print-css";
+  document.getElementById(PID)?.remove();
+  document.getElementById(SID)?.remove();
+  const div = document.createElement("div");
+  div.id = PID;
+  div.innerHTML = `<div style="background:white;padding:16px;font-family:Segoe UI,Arial,sans-serif;">
+    ${tableHTML}
+    <p style="margin-top:14px;font-size:8pt;color:#999;">Generated: ${new Date().toLocaleString("en-IN")} · Efforts Intelligence Dashboard</p>
+  </div>`;
+  document.body.appendChild(div);
+  const style = document.createElement("style");
+  style.id = SID;
+  style.textContent = `@media print{body>*:not(#${PID}){display:none!important}#${PID}{display:block!important;position:fixed;top:0;left:0;width:100%;background:white}@page{margin:12mm;size:A4 landscape}}#${PID}{display:none}`;
+  document.head.appendChild(style);
+  setTimeout(() => {
+    window.print();
+    setTimeout(() => { document.getElementById(PID)?.remove(); document.getElementById(SID)?.remove(); }, 3000);
+  }, 200);
+}
+
+</script>
+
+<!-- §2 UI Components (Babel JSX) -->
+<script type="text/babel" data-presets="react">
+const {useState,useCallback,useRef,useMemo,useEffect}=React;
+
+// ── colour helpers ──────────────────────────────────────────────────
+const C = {
+  shift:{
+    ROW:{bg:'#EFF6FF',text:'#1D4ED8',dot:'#3B82F6'},
+    'US Evening':{bg:'#F5F3FF',text:'#6D28D9',dot:'#8B5CF6'},
+    'US Night':{bg:'#FDF4FF',text:'#9333EA',dot:'#A855F7'},
+    Unknown:{bg:'#F8FAFC',text:'#64748B',dot:'#94A3B8'},
+  },
+  sev:{
+    CRITICAL:{bg:'#FEF2F2',text:'#DC2626',border:'#FECACA',dot:'#EF4444'},
+    HIGH:    {bg:'#FFFBEB',text:'#D97706',border:'#FDE68A',dot:'#F59E0B'},
+    MEDIUM:  {bg:'#EFF6FF',text:'#2563EB',border:'#BFDBFE',dot:'#3B82F6'},
+  },
+  score:{
+    0:{bg:'#FEF2F2',text:'#DC2626',label:'Dead'},
+    1:{bg:'#FFFBEB',text:'#D97706',label:'Low'},
+    2:{bg:'#EFF6FF',text:'#2563EB',label:'Mid'},
+    3:{bg:'#ECFDF5',text:'#16A34A',label:'High'},
+  }
+};
+
+function scoreColor(s){const m={3:'#16A34A',2:'#2563EB',1:'#D97706',0:'#DC2626'};return m[s]??'#94A3B8';}
+function bscRingColor(v){if(v>=80)return'#16A34A';if(v>=60)return'#D97706';return'#DC2626';}
+function pctColor(v){if(v>=1)return'var(--green)';if(v>=0.75)return'var(--amber)';return'var(--red)';}
+
+// ── tiny atoms ─────────────────────────────────────────────────────
+function Chip({label,color,bg,border}){
+  return <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 9px',
+    borderRadius:20,fontSize:11,fontWeight:600,color,background:bg,
+    border:`1px solid ${border||bg}`}}>{label}</span>;
+}
+function ShiftChip({cat}){
+  const c=C.shift[cat]||C.shift.Unknown;
+  return <span style={{display:'inline-flex',alignItems:'center',gap:5,padding:'3px 10px',
+    borderRadius:20,fontSize:11,fontWeight:600,color:c.text,background:c.bg}}>
+    <span style={{width:6,height:6,borderRadius:'50%',background:c.dot,flexShrink:0}}/>
+    {cat}
+  </span>;
+}
+function SevChip({sev}){
+  if(!sev) return null;
+  const c=C.sev[sev]||C.sev.MEDIUM;
+  return <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 9px',
+    borderRadius:20,fontSize:10,fontWeight:700,letterSpacing:'0.04em',
+    color:c.text,background:c.bg,border:`1px solid ${c.border}`}}>
+    <span style={{width:5,height:5,borderRadius:'50%',background:c.dot}}/>{sev}
+  </span>;
+}
+function Trend({value,label,isDark}){
+  if(value==null) return null;
+  const pos=value>=0;
+  return <span style={{fontSize:12,fontWeight:600,color:pos?'var(--green)':'var(--red)',marginLeft:6}}>
+    {pos?'↑':'↓'}{Math.abs(value).toFixed(1)}{label||''}
+  </span>;
+}
+function MiniBar({value,max,color}){
+  const pct=max>0?Math.min(value/max,1)*100:0;
+  return <div style={{height:5,borderRadius:3,background:'var(--border)',overflow:'hidden',width:'100%'}}>
+    <div style={{width:pct+'%',height:'100%',background:color||'var(--blue)',borderRadius:3,
+      transition:'width .4s ease'}}/>
+  </div>;
+}
+function ProgressRing({value,size=48,stroke=5}){
+  const r=(size-stroke)/2,circ=2*Math.PI*r,pct=Math.min(value/100,1);
+  const color=bscRingColor(value);
+  return <svg width={size} height={size} style={{transform:'rotate(-90deg)'}}>
+    <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="var(--border)" strokeWidth={stroke}/>
+    <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={stroke}
+      strokeDasharray={circ} strokeDashoffset={circ*(1-pct)} strokeLinecap="round"
+      style={{transition:'stroke-dashoffset .5s ease'}}/>
+  </svg>;
+}
+function Card({children,style,className}){
+  return <div className={`card ${className||''}`}
+    style={{background:'var(--surface)',borderRadius:'var(--r)',border:'1px solid var(--border)',
+    boxShadow:'var(--shadow)',...style}}>{children}</div>;
+}
+function Divider(){return <div style={{height:1,background:'var(--border)',margin:'0 0 16px'}}/>;}
+function EmptyState({icon,title,sub}){
+  return <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',
+    padding:'60px 20px',gap:12}}>
+    <div style={{fontSize:44}}>{icon}</div>
+    <div style={{fontSize:15,fontWeight:700,color:'var(--text)'}}>{title}</div>
+    {sub&&<div style={{fontSize:13,color:'var(--muted)',textAlign:'center',maxWidth:320,lineHeight:1.6}}>{sub}</div>}
+  </div>;
+}
+
+// ── KPI CARD ───────────────────────────────────────────────────────
+function KpiCard({icon,label,value,sub,subColor,trend,trendLabel,accent}){
+  return <Card style={{padding:'18px 20px',flex:1,minWidth:140}}>
+    <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between'}}>
+      <div style={{flex:1}}>
+        <div style={{fontSize:11,fontWeight:600,color:'var(--muted)',letterSpacing:'0.06em',
+          textTransform:'uppercase',marginBottom:8}}>{label}</div>
+        <div style={{fontSize:28,fontWeight:800,color:accent||'var(--text)',lineHeight:1,marginBottom:6}}>
+          {value}
+        </div>
+        <div style={{fontSize:12,color:'var(--muted)'}}>
+          {sub}
+          {trend!=null&&<Trend value={trend} label={trendLabel}/>}
+        </div>
+      </div>
+      <div style={{width:40,height:40,borderRadius:10,
+        background:accent?accent+'18':'var(--blue-bg)',
+        display:'flex',alignItems:'center',justifyContent:'center',
+        fontSize:18,marginLeft:12,flexShrink:0}}>{icon}</div>
+    </div>
+  </Card>;
+}
+
+// ── TOP BAR ─────────────────────────────────────────────────────────
+function TopBar({file,uploadTime,isDark,onToggleDark,loading,anomalyCount}){
+  const fileRef=useRef();
+  return <div className="topbar" style={{
+    background:'var(--navy)',height:60,display:'flex',alignItems:'center',
+    padding:'0 24px',gap:16,flexShrink:0,zIndex:100,
+    boxShadow:'0 2px 8px rgba(0,0,0,0.15)'}}>
+    {/* Logo */}
+    <div style={{display:'flex',alignItems:'center',gap:10,marginRight:8}}>
+      <div style={{width:32,height:32,borderRadius:8,
+        background:'linear-gradient(135deg,#F26522,#FFB347)',
+        display:'flex',alignItems:'center',justifyContent:'center',fontSize:17}}>⚡</div>
+      <div>
+        <div style={{fontSize:14,fontWeight:800,color:'#fff',letterSpacing:'-0.3px',lineHeight:1.1}}>
+          Efforts Intelligence
+        </div>
+        <div style={{fontSize:10,color:'rgba(255,255,255,.5)',letterSpacing:'0.06em'}}>
+          OIP · DIALER ANALYTICS
+        </div>
+      </div>
+    </div>
+
+    {/* Upload zone */}
+    <label style={{display:'flex',alignItems:'center',gap:8,
+      background:file?'rgba(242,101,34,.15)':'rgba(255,255,255,.08)',
+      border:`1.5px dashed ${file?'rgba(242,101,34,.6)':'rgba(255,255,255,.2)'}`,
+      borderRadius:8,padding:'6px 14px',cursor:'pointer',transition:'all .2s',
+      color:file?'#FFB347':'rgba(255,255,255,.75)',fontSize:12,fontWeight:500}}>
+      <span style={{fontSize:16}}>{loading?'⏳':file?'✅':'📂'}</span>
+      <span>{loading?'Processing…':file?file.name:'Upload Dialer CSV'}</span>
+      <input type="file" accept=".csv" style={{display:'none'}} ref={fileRef}
+        onChange={e=>e.target.files[0]&&window._onFile&&window._onFile(e.target.files[0])}/>
+    </label>
+
+    {file&&uploadTime&&
+      <span style={{fontSize:11,color:'rgba(255,255,255,.5)'}}>
+        ⏱ {fmtUpload(uploadTime)}
+      </span>}
+
+    <div style={{flex:1}}/>
+
+    {anomalyCount>0&&
+      <div style={{background:'rgba(239,68,68,.15)',border:'1px solid rgba(239,68,68,.4)',
+        borderRadius:6,padding:'4px 10px',fontSize:11,fontWeight:700,color:'#FCA5A5'}}>
+        ⚠ {anomalyCount} anomalies
+      </div>}
+
+    <button onClick={onToggleDark}
+      style={{background:'rgba(255,255,255,.08)',border:'1px solid rgba(255,255,255,.15)',
+      color:'rgba(255,255,255,.7)',borderRadius:7,padding:'6px 12px',fontSize:12,fontWeight:600}}>
+      {isDark?'☀ Light':'🌙 Dark'}
+    </button>
+  </div>;
+}
+
+// ── SHIFT DAY PILLS ─────────────────────────────────────────────────
+function ShiftPills({shiftDays,crossMap,value,onChange}){
+  return <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+    <span style={{fontSize:11,fontWeight:700,color:'var(--muted)',
+      letterSpacing:'0.07em',textTransform:'uppercase'}}>Shift</span>
+    {['all',...shiftDays].map(d=>{
+      const active=value===d;
+      return <button key={d} onClick={()=>onChange(d)} style={{
+        padding:'5px 14px',borderRadius:20,fontSize:12,fontWeight:active?700:500,
+        border:`1.5px solid ${active?'var(--navy)':'var(--border)'}`,
+        background:active?'var(--navy)':'var(--surface)',
+        color:active?'#fff':'var(--muted)',transition:'all .15s'}}>
+        {d==='all'?'All Days':fmtDate(d)}
+        {d!=='all'&&crossMap[d]>0&&
+          <span style={{marginLeft:6,fontSize:9,color:active?'rgba(255,255,255,.7)':'var(--amber)'}}>
+            ↩{crossMap[d]}
+          </span>}
+      </button>;
+    })}
+  </div>;
+}
+
+// ── TAB BAR ─────────────────────────────────────────────────────────
+function TabBar({tabs,active,onChange}){
+  return <div style={{display:'flex',borderBottom:'2px solid var(--border)',gap:0,overflowX:'auto'}}>
+    {tabs.map(t=>{
+      const isActive=active===t.id;
+      return <button key={t.id} onClick={()=>onChange(t.id)}
+        style={{padding:'12px 20px',background:'none',border:'none',
+        fontSize:13,fontWeight:isActive?700:500,color:isActive?'var(--navy)':'var(--muted)',
+        borderBottom:`2.5px solid ${isActive?'var(--orange)':'transparent'}`,
+        marginBottom:-2,whiteSpace:'nowrap',transition:'all .15s',cursor:'pointer',
+        letterSpacing:'-0.1px'}}>
+        {t.badge?
+          <span style={{display:'inline-flex',alignItems:'center',gap:6}}>
+            {t.label}
+            <span style={{background:'var(--orange)',color:'#fff',borderRadius:10,
+              padding:'1px 6px',fontSize:10,fontWeight:700}}>{t.badge}</span>
+          </span>:t.label}
+      </button>;
+    })}
+  </div>;
+}
+
+// ── UPLOAD ZONE (empty state) ───────────────────────────────────────
+function UploadHero({onFile}){
+  const [drag,setDrag]=useState(false);
+  const handleDrop=e=>{
+    e.preventDefault();setDrag(false);
+    const f=e.dataTransfer.files[0];
+    if(f&&f.name.endsWith('.csv'))onFile(f);
+  };
+  return <div style={{display:'flex',alignItems:'center',justifyContent:'center',
+    minHeight:'60vh',padding:40}}>
+    <div style={{maxWidth:480,textAlign:'center'}}>
+      <div style={{fontSize:56,marginBottom:20}}>📊</div>
+      <h2 style={{fontSize:24,fontWeight:800,color:'var(--navy)',marginBottom:10}}>
+        Efforts Intelligence
+      </h2>
+      <p style={{fontSize:14,color:'var(--muted)',lineHeight:1.7,marginBottom:32}}>
+        Upload your dialer CSV to get instant shift analysis, effort scoring,
+        BSC projection, anomaly detection, and dead hour tracking.
+      </p>
+      <label
+        onDragOver={e=>{e.preventDefault();setDrag(true);}}
+        onDragLeave={()=>setDrag(false)}
+        onDrop={handleDrop}
+        style={{display:'block',border:`2px dashed ${drag?'var(--orange)':'var(--border)'}`,
+        borderRadius:14,padding:'36px 40px',cursor:'pointer',
+        background:drag?'rgba(242,101,34,.04)':'var(--surface)',transition:'all .2s',
+        boxShadow:drag?'0 0 0 4px rgba(242,101,34,.1)':'none'}}>
+        <div style={{fontSize:32,marginBottom:12}}>📂</div>
+        <div style={{fontSize:15,fontWeight:700,color:'var(--text)',marginBottom:6}}>
+          Drop CSV here or click to browse
+        </div>
+        <div style={{fontSize:12,color:'var(--muted)'}}>
+          Dialer export · Any size · Processed entirely in your browser
+        </div>
+        <input type="file" accept=".csv" style={{display:'none'}}
+          onChange={e=>e.target.files[0]&&onFile(e.target.files[0])}/>
+      </label>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12,marginTop:24}}>
+        {[
+          {icon:'🎯',title:'Shift Detection',sub:'10 AM rule, IST-safe'},
+          {icon:'🚨',title:'6-Rule Anomaly Engine',sub:'Ghost Login, Near-Zero…'},
+          {icon:'📈',title:'BSC Projection',sub:'80–85% accuracy'},
+        ].map(c=><div key={c.title} style={{background:'var(--surface)',border:'1px solid var(--border)',
+          borderRadius:10,padding:'14px 12px',textAlign:'center',boxShadow:'var(--shadow)'}}>
+          <div style={{fontSize:20,marginBottom:6}}>{c.icon}</div>
+          <div style={{fontSize:12,fontWeight:700,color:'var(--text)',marginBottom:3}}>{c.title}</div>
+          <div style={{fontSize:10,color:'var(--muted)'}}>{c.sub}</div>
+        </div>)}
+      </div>
+    </div>
+  </div>;
+}
+
+// ── EXPORT BAR ──────────────────────────────────────────────────────
+function ExportBar({data,shiftFilter,absences,sortedRows}){
+  const [copied,setCopied]=useState(false);
+  const btnStyle=(primary)=>({
+    display:'inline-flex',alignItems:'center',gap:6,
+    padding:'8px 16px',borderRadius:8,fontSize:12,fontWeight:600,
+    border:`1.5px solid ${primary?'var(--orange)':'var(--border)'}`,
+    background:primary?'var(--orange)':'var(--surface)',
+    color:primary?'#fff':'var(--text)',
+    transition:'all .15s',cursor:'pointer',
+  });
+  return <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',
+    padding:'12px 0',borderTop:'1px solid var(--border)',marginTop:12}}>
+    <span style={{fontSize:11,fontWeight:700,color:'var(--muted)',
+      letterSpacing:'0.07em',textTransform:'uppercase',marginRight:4}}>Export</span>
+    <button style={btnStyle(true)} onClick={()=>doExcelExport(data,shiftFilter,absences)}>
+      📥 Excel
+    </button>
+    <button style={btnStyle(false)} onClick={()=>doCopyExcel(data,shiftFilter,absences,setCopied,sortedRows)}>
+      {copied?'✅ Copied!':'📋 Copy'}
+    </button>
+    <button style={btnStyle(false)} onClick={()=>doPDF(data,shiftFilter,absences)}>
+      🖨 PDF
+    </button>
+  </div>;
+}
+
+// ── DAILY SUMMARY TABLE ─────────────────────────────────────────────
+function DailySummaryTable({data,shiftFilter,absences}){
+  const [sortCol,setSortCol]=useState('dials');
+  const [sortDir,setSortDir]=useState(-1);
+  const [search,setSearch]=useState('');
+
+  const rows=useMemo(()=>{
+    let d=(shiftFilter==='all'?data:data.filter(r=>r.shiftDay===shiftFilter));
+    if(search) d=d.filter(r=>r.advisor.toLowerCase().includes(search.toLowerCase()));
+    return [...d].sort((a,b)=>{
+      const av=a[sortCol]??0,bv=b[sortCol]??0;
+      return(av-bv)*sortDir;
+    });
+  },[data,shiftFilter,search,sortCol,sortDir]);
+
+  const toggleSort=col=>{if(sortCol===col)setSortDir(d=>-d);else{setSortCol(col);setSortDir(-1);}};
+
+  const TH=({col,label,align})=>(
+    <th onClick={()=>toggleSort(col)} style={{padding:'10px 14px',fontSize:11,fontWeight:700,
+      color:'var(--muted)',textTransform:'uppercase',letterSpacing:'0.06em',
+      textAlign:align||'left',whiteSpace:'nowrap',cursor:'pointer',userSelect:'none',
+      background:'var(--surface)',borderBottom:'2px solid var(--border)',
+      position:'sticky',top:0,zIndex:2}}>
+      {label}{sortCol===col?<span style={{marginLeft:4,color:'var(--navy)'}}>{sortDir===-1?'↓':'↑'}</span>:''}
+    </th>
+  );
+
+  return <div>
+    <div style={{display:'flex',gap:12,alignItems:'center',marginBottom:16,flexWrap:'wrap'}}>
+      <div style={{position:'relative',flex:'0 0 220px'}}>
+        <span style={{position:'absolute',left:10,top:'50%',transform:'translateY(-50%)',
+          color:'var(--muted)',fontSize:14}}>🔍</span>
+        <input value={search} onChange={e=>setSearch(e.target.value)}
+          placeholder="Search advisor…"
+          style={{width:'100%',padding:'8px 10px 8px 32px',border:'1.5px solid var(--border)',
+          borderRadius:8,fontSize:13,color:'var(--text)',background:'var(--surface)',
+          outline:'none'}}/>
+      </div>
+      <span style={{fontSize:12,color:'var(--muted)',marginLeft:'auto'}}>
+        {rows.length} advisor{rows.length!==1?'s':''}
+      </span>
+    </div>
+
+    <div style={{overflow:'auto',borderRadius:10,border:'1px solid var(--border)'}}>
+      <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+        <thead>
+          <tr>
+            <TH col="advisor" label="Advisor"/>
+            <TH col="shiftCategory" label="Shift"/>
+            <TH col="shiftDay" label="Date"/>
+            <TH col="dials" label="Dials" align="right"/>
+            <TH col="connected" label="Connected" align="right"/>
+            <TH col="ptt" label="PTT (min)" align="right"/>
+            <TH col="deadCount" label="Dead Hrs" align="right"/>
+            <TH col="avgScore" label="Avg Score" align="right"/>
+            <th style={{padding:'10px 14px',fontSize:11,fontWeight:700,color:'var(--muted)',
+              textTransform:'uppercase',letterSpacing:'0.06em',textAlign:'center',
+              background:'var(--surface)',borderBottom:'2px solid var(--border)',
+              position:'sticky',top:0,zIndex:2}}>Anomaly</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row,i)=>{
+            const absent=isAbsent(row.advisor,row.shiftDay,absences);
+            const {findings,severity,flagged}=evaluateAnomalies(row,null);
+            const connRate=row.dials>0?(row.connected/row.dials*100).toFixed(0):0;
+            return <tr key={`${row.advisor}-${row.shiftDay}`}
+              style={{borderBottom:'1px solid var(--border)',
+              opacity:absent?.5:1,
+              background:i%2===0?'var(--surface)':'rgba(238,241,248,.3)'}}>
+
+              <td style={{padding:'10px 14px'}}>
+                <div style={{fontWeight:600,color:'var(--text)',marginBottom:2}}>{row.advisor}</div>
+                {absent&&<span style={{fontSize:10,fontWeight:700,color:'var(--red)',
+                  background:'var(--red-bg)',padding:'1px 7px',borderRadius:10}}>ABSENT</span>}
+              </td>
+
+              <td style={{padding:'10px 14px'}}><ShiftChip cat={row.shiftCategory||row.shiftCat||'Unknown'}/></td>
+
+              <td style={{padding:'10px 14px',fontSize:12,color:'var(--muted)',whiteSpace:'nowrap'}}>
+                {fmtDate(row.shiftDay)}
+              </td>
+
+              <td style={{padding:'10px 14px',textAlign:'right'}}>
+                <span style={{fontWeight:700,color:'var(--text)'}}>{row.dials}</span>
+                <div style={{fontSize:10,color:'var(--muted)',marginTop:2}}>{connRate}% conn</div>
+              </td>
+
+              <td style={{padding:'10px 14px',textAlign:'right'}}>
+                <span style={{fontWeight:600,color:row.connected>=14?'var(--green)':row.connected>=8?'var(--amber)':'var(--red)'}}>
+                  {row.connected}
+                </span>
+              </td>
+
+              <td style={{padding:'10px 14px',textAlign:'right'}}>
+                <span style={{fontWeight:600,color:row.ptt>=100?'var(--green)':row.ptt>=60?'var(--amber)':'var(--red)'}}>
+                  {fmtPTT(row.ptt)}
+                </span>
+              </td>
+
+              <td style={{padding:'10px 14px',textAlign:'right'}}>
+                {row.deadCount>0
+                  ?<span style={{fontWeight:700,color:'var(--red)',background:'var(--red-bg)',
+                    padding:'2px 8px',borderRadius:6,fontSize:12}}>{row.deadCount}</span>
+                  :<span style={{color:'var(--green)',fontWeight:600}}>—</span>}
+              </td>
+
+              <td style={{padding:'10px 14px',textAlign:'right'}}>
+                <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:4}}>
+                  <span style={{fontWeight:700,color:scoreColor(Math.round(row.avgScore)),fontSize:13}}>
+                    {row.avgScore.toFixed(1)}
+                  </span>
+                  <div style={{width:60}}>
+                    <MiniBar value={row.avgScore} max={3} color={scoreColor(Math.round(row.avgScore))}/>
+                  </div>
+                </div>
+              </td>
+
+              <td style={{padding:'10px 14px',textAlign:'center'}}>
+                {flagged&&!absent
+                  ?<div>
+                    <SevChip sev={severity}/>
+                    <div style={{fontSize:10,color:'var(--muted)',marginTop:4,maxWidth:160,
+                      textAlign:'left',lineHeight:1.4}}>
+                      {findings[0]?.reason}
+                    </div>
+                  </div>
+                  :<span style={{color:'var(--green)',fontSize:16}}>✓</span>}
+              </td>
+            </tr>;
+          })}
+          {rows.length===0&&<tr><td colSpan={9}>
+            <EmptyState icon="🔍" title="No advisors match" sub="Try a different search or shift filter"/>
+          </td></tr>}
+        </tbody>
+      </table>
+    </div>
+    <ExportBar data={data} shiftFilter={shiftFilter} absences={absences} sortedRows={rows}/>
+  </div>;
+}
+
+// ── BSC PROJECTION PANEL ────────────────────────────────────────────
+function BSCProjectionPanel({records,agg,shiftFilter,absences}){
+  const [search,setSearch]=useState('');
+
+  const projections=useMemo(()=>{
+    const filtered=shiftFilter==='all'?agg:agg.filter(r=>r.shiftDay===shiftFilter);
+    const advisors=[...new Set(filtered.map(r=>r.advisor))];
+    const totalDays=[...new Set(records.map(r=>r.shiftDay))].length;
+    return advisors
+      .filter(a=>!search||a.toLowerCase().includes(search.toLowerCase()))
+      .map(advisor=>{
+        const dayRecs=records.filter(r=>r.advisor===advisor&&!r.anomaly&&
+          (shiftFilter==='all'||r.shiftDay===shiftFilter));
+        const shiftCat=(filtered.find(r=>r.advisor===advisor))?.shiftCategory||'Unknown';
+        const shiftDay=shiftFilter!=='all'?shiftFilter:dayRecs[0]?.shiftDay||'';
+        return projectBSCDay(advisor,shiftDay,dayRecs,shiftCat,totalDays);
+      })
+      .filter(p=>p&&!isAbsent(p.advisor,p.shiftDay,absences))
+      .sort((a,b)=>b.bsc-a.bsc);
+  },[records,agg,shiftFilter,absences,search]);
+
+  return <div>
+    <div style={{display:'flex',gap:12,marginBottom:20,flexWrap:'wrap',alignItems:'center'}}>
+      <div style={{position:'relative',flex:'0 0 220px'}}>
+        <span style={{position:'absolute',left:10,top:'50%',transform:'translateY(-50%)',
+          color:'var(--muted)',fontSize:14}}>🔍</span>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search advisor…"
+          style={{width:'100%',padding:'8px 10px 8px 32px',border:'1.5px solid var(--border)',
+          borderRadius:8,fontSize:13,background:'var(--surface)',color:'var(--text)',outline:'none'}}/>
+      </div>
+      <div style={{fontSize:12,color:'var(--muted)',marginLeft:'auto'}}>
+        {projections.filter(p=>p.eligibleBSC).length} / {projections.length} qualifying (≥60%)
+      </div>
+    </div>
+
+    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(340px,1fr))',gap:14}}>
+      {projections.map(p=>{
+        const ringColor=bscRingColor(p.bsc);
+        return <Card key={p.advisor} style={{padding:'18px 20px'}}>
+          {/* Header */}
+          <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
+            <div style={{position:'relative',flexShrink:0}}>
+              <ProgressRing value={p.bsc} size={52} stroke={5}/>
+              <div style={{position:'absolute',inset:0,display:'flex',flexDirection:'column',
+                alignItems:'center',justifyContent:'center'}}>
+                <span style={{fontSize:11,fontWeight:800,color:ringColor,lineHeight:1}}>
+                  {p.bsc.toFixed(0)}%
+                </span>
+              </div>
+            </div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontWeight:700,color:'var(--text)',fontSize:14,
+                whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
+                {p.advisor}
+              </div>
+              <div style={{display:'flex',gap:6,marginTop:4,flexWrap:'wrap'}}>
+                <ShiftChip cat={p.shiftCat}/>
+                {p.eligibleBSC
+                  ?<Chip label="Qualifying" color="var(--green)" bg="var(--green-bg)" border="var(--green-bd)"/>
+                  :<Chip label="Below Gate" color="var(--red)" bg="var(--red-bg)" border="var(--red-bd)"/>}
+              </div>
+            </div>
+            <div style={{textAlign:'right',flexShrink:0}}>
+              <div style={{fontSize:10,color:'var(--muted)',marginBottom:2}}>Confidence</div>
+              <div style={{fontSize:16,fontWeight:800,color:'var(--navy)'}}>{p.conf}%</div>
+            </div>
+          </div>
+
+          {/* KRA bars */}
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:14}}>
+            {p.kra.map(k=>{
+              const pct=k.pct;
+              const col=pct>=100?'var(--green)':pct>=75?'var(--amber)':'var(--red)';
+              return <div key={k.label}>
+                <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                  <span style={{fontSize:11,fontWeight:600,color:'var(--muted)'}}>{k.label}</span>
+                  <span style={{fontSize:11,fontWeight:700,color:col}}>{pct}%</span>
+                </div>
+                <MiniBar value={pct} max={100} color={col}/>
+              </div>;
+            })}
+          </div>
+
+          {/* Range + signals */}
+          <div style={{display:'flex',gap:8,fontSize:11,flexWrap:'wrap'}}>
+            <span style={{color:'var(--muted)'}}>Range: </span>
+            <span style={{fontWeight:600,color:'var(--text)'}}>{p.lo}% – {p.hi}%</span>
+            <span style={{marginLeft:'auto',color:'var(--muted)'}}>
+              {p.dials} dials · {p.connected} conn · {fmtPTT(p.ptt)} PTT
+            </span>
+          </div>
+          {p.mainRisk&&p.mainRisk!=='Within Normal Range'&&
+            <div style={{marginTop:8,padding:'6px 10px',borderRadius:6,background:'var(--amber-bg)',
+              border:'1px solid var(--amber-bd)',fontSize:11,color:'var(--amber)'}}>
+              ⚠ {p.mainRisk}
+            </div>}
+          {p.mainStrength&&p.mainStrength!=='Balanced Profile'&&
+            <div style={{marginTop:6,padding:'6px 10px',borderRadius:6,background:'var(--green-bg)',
+              border:'1px solid var(--green-bd)',fontSize:11,color:'var(--green)'}}>
+              ✓ {p.mainStrength}
+            </div>}
+        </Card>;
+      })}
+      {projections.length===0&&<div style={{gridColumn:'1/-1'}}>
+        <EmptyState icon="📈" title="No projections available" sub="Upload a CSV and select a shift to see BSC projections"/>
+      </div>}
+    </div>
+  </div>;
+}
+
+// ── HOURLY HEATMAP ──────────────────────────────────────────────────
+function HourlyHeatmap({data,shiftFilter,absences}){
+  const rows=useMemo(()=>(shiftFilter==='all'?data:data.filter(r=>r.shiftDay===shiftFilter))
+    .filter(r=>!isAbsent(r.advisor,r.shiftDay,absences))
+    .sort(sortByShiftCat),[data,shiftFilter,absences]);
+
+  const hours=Array.from({length:24},(_,i)=>i);
+  const fmtHr=h=>`${h.toString().padStart(2,'0')}:00`;
+
+  const cellBg=(hs,h)=>{
+    const c=hs[h];
+    if(!c||!c.inWindow) return 'transparent';
+    if(c.score===null) return 'transparent';
+    const colors={0:'#FEE2E2',1:'#FEF3C7',2:'#DBEAFE',3:'#D1FAE5'};
+    return colors[c.score]||'transparent';
+  };
+  const cellText=(hs,h)=>{
+    const c=hs[h];
+    if(!c||!c.inWindow||c.score===null) return null;
+    const colors={0:'#DC2626',1:'#D97706',2:'#2563EB',3:'#16A34A'};
+    return {color:colors[c.score],fontWeight:700,fontSize:11,text:c.d||''};
+  };
+
+  return <div>
+    <div style={{display:'flex',gap:10,marginBottom:16,alignItems:'center',flexWrap:'wrap'}}>
+      <span style={{fontSize:13,fontWeight:600,color:'var(--muted)'}}>Cell = Dials · Color = Effort Score</span>
+      <div style={{display:'flex',gap:8,marginLeft:'auto'}}>
+        {[{s:0,l:'Dead'},{s:1,l:'Low'},{s:2,l:'Mid'},{s:3,l:'High'}].map(({s,l})=>(
+          <div key={s} style={{display:'flex',alignItems:'center',gap:5}}>
+            <div style={{width:10,height:10,borderRadius:2,background:cellBg({[0]:{inWindow:true,score:s}},0).replace('transparent','#eee')}}/>
+            <span style={{fontSize:11,color:'var(--muted)'}}>{l}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+    <div style={{overflow:'auto',borderRadius:10,border:'1px solid var(--border)'}}>
+      <table style={{borderCollapse:'collapse',fontSize:11,width:'100%'}}>
+        <thead>
+          <tr style={{background:'var(--surface)'}}>
+            <th style={{padding:'8px 14px',textAlign:'left',fontWeight:700,color:'var(--muted)',
+              fontSize:10,textTransform:'uppercase',letterSpacing:'0.06em',
+              position:'sticky',left:0,background:'var(--surface)',zIndex:2,
+              borderBottom:'2px solid var(--border)',whiteSpace:'nowrap',minWidth:160}}>
+              Advisor / Shift
+            </th>
+            {hours.map(h=><th key={h} style={{padding:'6px 3px',textAlign:'center',fontWeight:600,
+              color:'var(--muted)',fontSize:9,borderBottom:'2px solid var(--border)',
+              minWidth:30,letterSpacing:'0'}}>
+              {h%3===0?fmtHr(h):''}
+            </th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row,i)=>(
+            <tr key={`${row.advisor}-${row.shiftDay}`}
+              style={{borderBottom:'1px solid var(--border)',
+              background:i%2===0?'var(--surface)':'rgba(238,241,248,.3)'}}>
+              <td style={{padding:'8px 14px',position:'sticky',left:0,
+                background:i%2===0?'var(--surface)':'#EEF1F8',zIndex:1,
+                borderRight:'2px solid var(--border)'}}>
+                <div style={{fontWeight:600,color:'var(--text)',marginBottom:3}}>{row.advisor}</div>
+                <ShiftChip cat={row.shiftCategory||row.shiftCat||'Unknown'}/>
+              </td>
+              {hours.map(h=>{
+                const ct=cellText(row.hourScores,h);
+                const bg=cellBg(row.hourScores,h);
+                return <td key={h} style={{padding:'4px 2px',textAlign:'center',
+                  background:bg,transition:'background .1s'}}>
+                  {ct&&<span style={{color:ct.color,fontWeight:ct.fontWeight,fontSize:ct.fontSize}}>
+                    {ct.text}
+                  </span>}
+                </td>;
+              })}
+            </tr>
+          ))}
+          {rows.length===0&&<tr><td colSpan={25}>
+            <EmptyState icon="⬜" title="No heatmap data" sub="Upload CSV to see hourly effort grid"/>
+          </td></tr>}
+        </tbody>
+      </table>
+    </div>
+  </div>;
+}
+
+// ── DEAD HOURS PANEL ────────────────────────────────────────────────
+function DeadHoursPanel({data,shiftFilter,absences}){
+  const rows=useMemo(()=>(shiftFilter==='all'?data:data.filter(r=>r.shiftDay===shiftFilter))
+    .filter(r=>r.deadCount>0&&!isAbsent(r.advisor,r.shiftDay,absences))
+    .sort((a,b)=>b.deadCount-a.deadCount),[data,shiftFilter,absences]);
+
+  const totalDead=rows.reduce((s,r)=>s+r.deadCount,0);
+  const totalWindow=rows.reduce((s,r)=>s+r.windowHours.length,0);
+
+  return <div>
+    {/* Summary bar */}
+    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(160px,1fr))',gap:12,marginBottom:20}}>
+      {[
+        {label:'Advisors with Dead Hours',value:rows.length,color:'var(--red)'},
+        {label:'Total Dead Hours',value:totalDead,color:'var(--red)'},
+        {label:'Window Hours (total)',value:totalWindow,color:'var(--text)'},
+        {label:'Dead Hour Rate',value:totalWindow>0?((totalDead/totalWindow)*100).toFixed(1)+'%':'—',
+          color:totalDead/totalWindow>.2?'var(--red)':'var(--amber)'},
+      ].map(c=><Card key={c.label} style={{padding:'14px 16px'}}>
+        <div style={{fontSize:10,fontWeight:700,color:'var(--muted)',letterSpacing:'0.07em',
+          textTransform:'uppercase',marginBottom:6}}>{c.label}</div>
+        <div style={{fontSize:24,fontWeight:800,color:c.color}}>{c.value}</div>
+      </Card>)}
+    </div>
+
+    {/* Table */}
+    <Card style={{overflow:'hidden'}}>
+      <div style={{overflow:'auto'}}>
+        <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+          <thead>
+            <tr>
+              {['Advisor','Shift','Dead Hours','Active Hours','Dead Rate','Hours Pattern'].map((h,i)=>(
+                <th key={h} style={{padding:'10px 16px',textAlign:i>=3?'right':'left',
+                  fontSize:10,fontWeight:700,color:'var(--muted)',textTransform:'uppercase',
+                  letterSpacing:'0.06em',background:'var(--surface)',
+                  borderBottom:'2px solid var(--border)',whiteSpace:'nowrap'}}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row,i)=>{
+              const deadRate=row.windowHours.length>0?row.deadCount/row.windowHours.length:0;
+              return <tr key={`${row.advisor}-${row.shiftDay}`}
+                style={{borderBottom:'1px solid var(--border)',
+                background:i%2===0?'var(--surface)':'rgba(238,241,248,.3)'}}>
+                <td style={{padding:'10px 16px'}}>
+                  <div style={{fontWeight:600,color:'var(--text)'}}>{row.advisor}</div>
+                  <div style={{fontSize:11,color:'var(--muted)',marginTop:2}}>{fmtDate(row.shiftDay)}</div>
+                </td>
+                <td style={{padding:'10px 16px'}}><ShiftChip cat={row.shiftCategory||'Unknown'}/></td>
+                <td style={{padding:'10px 16px'}}>
+                  <span style={{fontWeight:800,color:'var(--red)',fontSize:16}}>{row.deadCount}</span>
+                  <span style={{fontSize:11,color:'var(--muted)',marginLeft:4}}>hrs</span>
+                </td>
+                <td style={{padding:'10px 16px',textAlign:'right'}}>
+                  <span style={{fontWeight:600,color:'var(--green)'}}>{row.activeCount}</span>
+                </td>
+                <td style={{padding:'10px 16px',textAlign:'right'}}>
+                  <span style={{fontWeight:700,color:deadRate>.3?'var(--red)':deadRate>.15?'var(--amber)':'var(--green)'}}>
+                    {(deadRate*100).toFixed(0)}%
+                  </span>
+                </td>
+                <td style={{padding:'10px 16px',textAlign:'right'}}>
+                  <div style={{display:'flex',gap:2,justifyContent:'flex-end',flexWrap:'wrap'}}>
+                    {row.windowHours.map(h=>(
+                      <span key={h} style={{
+                        width:18,height:18,borderRadius:3,fontSize:9,fontWeight:600,
+                        display:'inline-flex',alignItems:'center',justifyContent:'center',
+                        background:row.hourScores[h]?.score===0?'#FEE2E2':
+                          row.hourScores[h]?.score===1?'#FEF3C7':
+                          row.hourScores[h]?.score===2?'#DBEAFE':'#D1FAE5',
+                        color:row.hourScores[h]?.score===0?'#DC2626':
+                          row.hourScores[h]?.score===1?'#D97706':
+                          row.hourScores[h]?.score===2?'#2563EB':'#16A34A',
+                      }}>{h}</span>
+                    ))}
+                  </div>
+                </td>
+              </tr>;
+            })}
+            {rows.length===0&&<tr><td colSpan={6}>
+              <EmptyState icon="✅" title="No dead hours detected" sub="All advisors are working during their active window"/>
+            </td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  </div>;
+}
+
+// ── ABSENCE MANAGER ─────────────────────────────────────────────────
+function AbsenceManager({agg,absences,onToggle,shiftFilter}){
+  const [search,setSearch]=useState('');
+
+  const rows=useMemo(()=>{
+    let d=shiftFilter==='all'?agg:agg.filter(r=>r.shiftDay===shiftFilter);
+    if(search) d=d.filter(r=>r.advisor.toLowerCase().includes(search.toLowerCase()));
+    return [...d].sort(sortByShiftCat);
+  },[agg,shiftFilter,search]);
+
+  const absentCount=rows.filter(r=>isAbsent(r.advisor,r.shiftDay,absences)).length;
+  const {findings:_,flagged:__,...rest}={};
+  const suspiciousRows=rows.filter(r=>{
+    const {flagged}=evaluateAnomalies(r,null);
+    return flagged&&!isAbsent(r.advisor,r.shiftDay,absences);
+  });
+
+  function Toggle({checked,onChange}){
+    return <button onClick={onChange} style={{
+      width:44,height:24,borderRadius:12,border:'none',cursor:'pointer',
+      background:checked?'var(--navy)':'var(--border)',transition:'background .2s',
+      position:'relative',padding:0,flexShrink:0}}>
+      <span style={{position:'absolute',top:3,
+        left:checked?22:3,width:18,height:18,borderRadius:'50%',
+        background:'#fff',transition:'left .2s',
+        boxShadow:'0 1px 3px rgba(0,0,0,.2)'}}/>
+    </button>;
+  }
+
+  return <div>
+    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(160px,1fr))',gap:12,marginBottom:20}}>
+      <Card style={{padding:'14px 16px'}}>
+        <div style={{fontSize:10,fontWeight:700,color:'var(--muted)',textTransform:'uppercase',
+          letterSpacing:'0.07em',marginBottom:6}}>Marked Absent</div>
+        <div style={{fontSize:24,fontWeight:800,color:'var(--red)'}}>{absentCount}</div>
+      </Card>
+      <Card style={{padding:'14px 16px'}}>
+        <div style={{fontSize:10,fontWeight:700,color:'var(--muted)',textTransform:'uppercase',
+          letterSpacing:'0.07em',marginBottom:6}}>Suspicious Activity</div>
+        <div style={{fontSize:24,fontWeight:800,color:'var(--amber)'}}>{suspiciousRows.length}</div>
+      </Card>
+    </div>
+
+    {suspiciousRows.length>0&&<div style={{background:'var(--amber-bg)',border:'1px solid var(--amber-bd)',
+      borderRadius:10,padding:'12px 16px',marginBottom:16}}>
+      <div style={{fontSize:12,fontWeight:700,color:'var(--amber)',marginBottom:8}}>
+        ⚠ Suspicious Inactivity — confirm absent or leave as flagged
+      </div>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+        {suspiciousRows.map(r=>(
+          <button key={r.advisor+r.shiftDay} onClick={()=>onToggle(r.advisor,r.shiftDay)}
+            style={{padding:'4px 12px',borderRadius:6,border:'1px solid var(--amber-bd)',
+            background:'#fff',fontSize:12,fontWeight:600,color:'var(--amber)',cursor:'pointer'}}>
+            Mark absent: {r.advisor} ({fmtDate(r.shiftDay)})
+          </button>
+        ))}
+      </div>
+    </div>}
+
+    <div style={{marginBottom:12}}>
+      <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search advisor…"
+        style={{padding:'8px 12px',border:'1.5px solid var(--border)',borderRadius:8,
+        fontSize:13,color:'var(--text)',background:'var(--surface)',outline:'none',width:220}}/>
+    </div>
+
+    <Card style={{overflow:'hidden'}}>
+      <div style={{overflow:'auto'}}>
+        <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+          <thead>
+            <tr>
+              {['Advisor','Shift','Date','Dials','Status','Absent Toggle'].map((h,i)=>(
+                <th key={h} style={{padding:'10px 16px',textAlign:i>=3?'center':'left',
+                  fontSize:10,fontWeight:700,color:'var(--muted)',textTransform:'uppercase',
+                  letterSpacing:'0.06em',background:'var(--surface)',
+                  borderBottom:'2px solid var(--border)',whiteSpace:'nowrap'}}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row,i)=>{
+              const absent=isAbsent(row.advisor,row.shiftDay,absences);
+              const {flagged,severity}=evaluateAnomalies(row,null);
+              return <tr key={`${row.advisor}-${row.shiftDay}`}
+                style={{borderBottom:'1px solid var(--border)',opacity:absent?.55:1,
+                background:i%2===0?'var(--surface)':'rgba(238,241,248,.3)'}}>
+                <td style={{padding:'10px 16px'}}>
+                  <div style={{fontWeight:600,color:'var(--text)'}}>{row.advisor}</div>
+                </td>
+                <td style={{padding:'10px 16px'}}><ShiftChip cat={row.shiftCategory||'Unknown'}/></td>
+                <td style={{padding:'10px 16px',color:'var(--muted)',fontSize:12}}>{fmtDate(row.shiftDay)}</td>
+                <td style={{padding:'10px 16px',textAlign:'center',fontWeight:600,color:'var(--text)'}}>{row.dials}</td>
+                <td style={{padding:'10px 16px',textAlign:'center'}}>
+                  {absent
+                    ?<Chip label="ABSENT" color="var(--red)" bg="var(--red-bg)" border="var(--red-bd)"/>
+                    :flagged
+                      ?<SevChip sev={severity}/>
+                      :<Chip label="Active" color="var(--green)" bg="var(--green-bg)" border="var(--green-bd)"/>}
+                </td>
+                <td style={{padding:'10px 16px',textAlign:'center'}}>
+                  <Toggle checked={absent} onChange={()=>onToggle(row.advisor,row.shiftDay)}/>
+                </td>
+              </tr>;
+            })}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  </div>;
+}
+
+// ── RECONCILIATION QUEUE ────────────────────────────────────────────
+function ReconciliationQueue({anomalies,decisions,onDecide,currentShiftDay}){
+  if(anomalies.length===0) return (
+    <EmptyState icon="✅" title="No anomalies detected"
+      sub="All records fall within the expected shift window. Cross-midnight drift within normal range."/>
+  );
+  return <div>
+    <div style={{background:'var(--blue-bg)',border:'1px solid var(--blue-bd)',
+      borderRadius:10,padding:'12px 16px',marginBottom:20,fontSize:13,color:'var(--blue)'}}>
+      <strong>ℹ How this works:</strong> Records timestamped after the upload time may belong to
+      a different shift. Choose to keep or reassign each one. Decisions persist for 7 days.
+    </div>
+    <div style={{display:'flex',flexDirection:'column',gap:10}}>
+      {anomalies.map(a=>{
+        const dec=decisions[a.id];
+        return <Card key={a.id} style={{padding:'16px 18px'}}>
+          <div style={{display:'flex',gap:16,alignItems:'flex-start',flexWrap:'wrap'}}>
+            <div style={{flex:1,minWidth:200}}>
+              <div style={{fontWeight:700,color:'var(--text)',marginBottom:4}}>{a.advisor}</div>
+              <div style={{fontSize:12,color:'var(--muted)'}}>
+                Hour <strong>{a.hour}:00</strong> · Shift day <strong>{fmtDate(a.shiftDay)}</strong>
+                · Drift <strong>{a.driftH}h</strong> ahead
+              </div>
+              <div style={{fontSize:11,color:'var(--muted)',marginTop:4}}>{a.count} dial record(s)</div>
+            </div>
+            <div style={{display:'flex',gap:8,flexShrink:0,flexWrap:'wrap'}}>
+              {dec&&<Chip label={dec.action==='keep'?'Kept as-is':'Moved to '+fmtDate(currentShiftDay)}
+                color={dec.action==='keep'?'var(--amber)':'var(--green)'}
+                bg={dec.action==='keep'?'var(--amber-bg)':'var(--green-bg)'}/>}
+              <button onClick={()=>onDecide(a.id,'move')}
+                style={{padding:'6px 14px',borderRadius:8,border:'1.5px solid var(--green-bd)',
+                background:dec?.action==='move'?'var(--green)':'var(--green-bg)',
+                color:dec?.action==='move'?'#fff':'var(--green)',
+                fontSize:12,fontWeight:600,cursor:'pointer'}}>
+                → Move to {fmtDate(currentShiftDay||a.shiftDay)}
+              </button>
+              <button onClick={()=>onDecide(a.id,'keep')}
+                style={{padding:'6px 14px',borderRadius:8,border:'1.5px solid var(--amber-bd)',
+                background:dec?.action==='keep'?'var(--amber)':'var(--amber-bg)',
+                color:dec?.action==='keep'?'#fff':'var(--amber)',
+                fontSize:12,fontWeight:600,cursor:'pointer'}}>
+                Keep as {fmtDate(a.shiftDay)}
+              </button>
+              {dec&&<button onClick={()=>onDecide(a.id,null)}
+                style={{padding:'6px 10px',borderRadius:8,border:'1px solid var(--border)',
+                background:'var(--surface)',color:'var(--muted)',fontSize:12,cursor:'pointer'}}>
+                ✕
+              </button>}
+            </div>
+          </div>
+        </Card>;
+      })}
+    </div>
+  </div>;
+}
+
+// ── MAIN APP ────────────────────────────────────────────────────────
+function App(){
+  const [isDark,setIsDark]=useState(false);
+  const [file,setFile]=useState(null);
+  const [uploadTime,setUploadTime]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const [records,setRecords]=useState([]);
+  const [agg,setAgg]=useState([]);
+  const [anomalies,setAnomalies]=useState([]);
+  const [decisions,setDecisions]=useState({});
+  const [absences,setAbsences]=useState({});
+  const [tab,setTab]=useState('summary');
+  const [shiftFilter,setShiftFilter]=useState('all');
+
+  // register upload handler for topbar
+  useEffect(()=>{window._onFile=handleFile;},[]);
+
+  // load persisted state
+  useEffect(()=>{
+    (async()=>{
+      try{const r=await window.storage?.get?.('eff_recon_v5');
+        if(r?.value){const now=Date.now();
+          setDecisions(Object.fromEntries(Object.entries(JSON.parse(r.value)).filter(([,v])=>now-v.ts<7*86400000)));}}catch{}
+      try{const r=await window.storage?.get?.('eff_abs_v2');
+        if(r?.value){const now=Date.now();
+          setAbsences(Object.fromEntries(Object.entries(JSON.parse(r.value)).filter(([,v])=>now-v.ts<ABS_TTL)));}}catch{}
+    })();
+  },[]);
+
+  const handleAbsenceToggle=useCallback((advisor,shiftDay)=>{
+    setAbsences(prev=>{
+      const next={...prev};const k=absKey(advisor,shiftDay);
+      if(next[k])delete next[k];else next[k]={ts:Date.now()};
+      window.storage?.set?.('eff_abs_v2',JSON.stringify(next)).catch(()=>{});
+      return next;
+    });
+  },[]);
+
+  const handleDecide=useCallback((id,action)=>{
+    setDecisions(prev=>{
+      const next={...prev};
+      if(!action)delete next[id];else next[id]={action,ts:Date.now()};
+      window.storage?.set?.('eff_recon_v5',JSON.stringify(next)).catch(()=>{});
+      return next;
+    });
+  },[]);
+
+  const currentShiftDay=useMemo(()=>{
+    if(!uploadTime)return null;
+    return toShiftDay(uploadTime,uploadTime.getHours());
+  },[uploadTime]);
+
+  const handleFile=useCallback(f=>{
+    setFile(f);const ut=new Date();setUploadTime(ut);setLoading(true);
+    Papa.parse(f,{header:true,skipEmptyLines:true,complete:({data:rows})=>{
+      const recs=processCSV(rows,ut);
+      const aggregated=buildAggregates(recs);
+      const anomMap={};
+      for(const r of recs.filter(r=>r.anomaly)){
+        const id=`${r.advisor}__${r.shiftDay}__${r.hour}`;
+        if(!anomMap[id]){const dh=Math.max(1,Math.ceil((r.createdDate.getTime()+r.hour*3600000-ut.getTime())/3600000));
+          anomMap[id]={id,advisor:r.advisor,shiftDay:r.shiftDay,hour:r.hour,driftH:dh,count:0};}
+        anomMap[id].count++;
+      }
+      setRecords(recs);setAgg(aggregated);setAnomalies(Object.values(anomMap));
+      setLoading(false);setShiftFilter('all');setTab('summary');
+    },error:()=>setLoading(false)});
+  },[]);
+
+  const stats=useMemo(()=>{
+    const normal=records.filter(r=>!r.anomaly);
+    const shiftDays=[...new Set(normal.map(r=>r.shiftDay))].sort();
+    const crossMap={};
+    for(const r of normal){if(localYMD(r.createdDate)!==r.shiftDay){
+      if(!crossMap[r.shiftDay])crossMap[r.shiftDay]=0;crossMap[r.shiftDay]++;}}
+    return{shiftDays,crossMap,
+      advisors:new Set(normal.map(r=>r.advisor)).size,
+      dials:normal.length,
+      connected:normal.reduce((s,r)=>s+r.connected,0),
+      ptt:normal.reduce((s,r)=>s+r.ptt,0)};
+  },[records]);
+
+  const absBadge=Object.keys(absences).filter(k=>{const ab=absences[k];return ab&&Date.now()-ab.ts<ABS_TTL;}).length;
+  const anomBadge=agg.filter(d=>!isAbsent(d.advisor,d.shiftDay,absences)&&evaluateAnomalies(d,null).flagged).length;
+
+  const TABS=[
+    {id:'summary',label:'Daily Summary'},
+    {id:'projection',label:'BSC Projection'},
+    {id:'heatmap',label:'Hourly Heatmap'},
+    {id:'dead',label:'Dead Hours'+(agg.some(d=>d.deadCount>0&&!isAbsent(d.advisor,d.shiftDay,absences))?` ●`:'')},
+    {id:'absence',label:'Absence Manager'+(absBadge+anomBadge>0?` (${absBadge+anomBadge})`:'')} ,
+    {id:'recon',label:'Reconciliation'+(anomalies.length?` (${anomalies.length})`:'')} ,
+  ];
+
+  const connRate=stats.dials>0?(stats.connected/stats.dials*100).toFixed(0):0;
+  const avgPTT=stats.connected>0?(stats.ptt/stats.connected).toFixed(1):0;
+
+  return <div className={isDark?'dark':''} style={{height:'100vh',display:'flex',
+    flexDirection:'column',background:'var(--bg)',color:'var(--text)'}}>
+
+    <TopBar file={file} uploadTime={uploadTime} isDark={isDark}
+      onToggleDark={()=>setIsDark(d=>!d)} loading={loading}
+      anomalyCount={anomalies.length}/>
+
+    <div style={{flex:1,overflow:'auto',padding:'24px 28px',display:'flex',flexDirection:'column',gap:20}}>
+
+      {!file&&!loading&&<UploadHero onFile={handleFile}/>}
+
+      {(file||loading)&&<>
+        {/* KPI Strip */}
+        <div style={{display:'flex',gap:14,flexWrap:'wrap'}}>
+          <KpiCard icon="👥" label="Advisors" value={stats.advisors}
+            sub={`${stats.shiftDays.length} shift day${stats.shiftDays.length!==1?'s':''}`}
+            accent="var(--navy)"/>
+          <KpiCard icon="📞" label="Total Dials" value={stats.dials.toLocaleString()}
+            sub={`${connRate}% connect rate`}/>
+          <KpiCard icon="🔗" label="Connected" value={stats.connected.toLocaleString()}
+            sub="calls answered"/>
+          <KpiCard icon="⏱" label="PTT" value={fmtPTT(stats.ptt)+' min'}
+            sub={`Avg ${avgPTT} min/call`}/>
+          <KpiCard icon="⚠" label="Anomalies" value={anomalies.length}
+            sub={anomalies.length>0?"Needs review":"All clear"}
+            accent={anomalies.length>0?'var(--red)':undefined}/>
+        </div>
+
+        {/* Shift pills */}
+        <Card style={{padding:'14px 18px'}}>
+          <ShiftPills shiftDays={stats.shiftDays} crossMap={stats.crossMap}
+            value={shiftFilter} onChange={setShiftFilter}/>
+        </Card>
+
+        {/* Main content card */}
+        <Card style={{padding:'20px 24px 24px',flex:1}}>
+          <TabBar tabs={TABS} active={tab} onChange={setTab}/>
+          <div style={{marginTop:20}}>
+            {tab==='summary'&&<DailySummaryTable data={agg} shiftFilter={shiftFilter} absences={absences}/>}
+            {tab==='projection'&&<BSCProjectionPanel records={records} agg={agg} shiftFilter={shiftFilter} absences={absences}/>}
+            {tab==='heatmap'&&<HourlyHeatmap data={agg} shiftFilter={shiftFilter} absences={absences}/>}
+            {tab==='dead'&&<DeadHoursPanel data={agg} shiftFilter={shiftFilter} absences={absences}/>}
+            {tab==='absence'&&<AbsenceManager agg={agg} absences={absences}
+              onToggle={handleAbsenceToggle} shiftFilter={shiftFilter}/>}
+            {tab==='recon'&&<ReconciliationQueue anomalies={anomalies} decisions={decisions}
+              onDecide={handleDecide} currentShiftDay={currentShiftDay}/>}
+          </div>
+        </Card>
+      </>}
+
+    </div>
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

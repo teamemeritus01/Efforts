@@ -1058,7 +1058,7 @@ function DailySummaryTable({data,shiftFilter,absences}){
   );
 
   return <div>
-    <div style={{display:'flex',gap:12,alignItems:'center',marginBottom:16,flexWrap:'wrap'}}>
+    <div style={{display:'flex',gap:10,alignItems:'center',marginBottom:16,flexWrap:'wrap'}}>
       <div style={{position:'relative',flex:'0 0 220px'}}>
         <span style={{position:'absolute',left:10,top:'50%',transform:'translateY(-50%)',
           color:'var(--muted)',fontSize:14}}>🔍</span>
@@ -1068,6 +1068,19 @@ function DailySummaryTable({data,shiftFilter,absences}){
           borderRadius:8,fontSize:13,color:'var(--text)',background:'var(--surface)',
           outline:'none'}}/>
       </div>
+      {/* Export buttons inline */}
+      <button style={{display:'inline-flex',alignItems:'center',gap:6,padding:'7px 14px',
+        borderRadius:8,fontSize:12,fontWeight:600,border:'1.5px solid var(--orange)',
+        background:'var(--orange)',color:'#fff',cursor:'pointer'}}
+        onClick={()=>doExcelExport(data,shiftFilter,absences)}>📥 Excel</button>
+      <button style={{display:'inline-flex',alignItems:'center',gap:6,padding:'7px 14px',
+        borderRadius:8,fontSize:12,fontWeight:600,border:'1.5px solid var(--border)',
+        background:'var(--surface)',color:'var(--text)',cursor:'pointer'}}
+        onClick={()=>doCopyExcel(data,shiftFilter,absences,()=>{},rows)}>📋 Copy</button>
+      <button style={{display:'inline-flex',alignItems:'center',gap:6,padding:'7px 14px',
+        borderRadius:8,fontSize:12,fontWeight:600,border:'1.5px solid var(--border)',
+        background:'var(--surface)',color:'var(--text)',cursor:'pointer'}}
+        onClick={()=>doPDF(data,shiftFilter,absences)}>🖨 PDF</button>
       <span style={{fontSize:12,color:'var(--muted)',marginLeft:'auto'}}>
         {rows.length} advisor{rows.length!==1?'s':''}
       </span>
@@ -1167,7 +1180,6 @@ function DailySummaryTable({data,shiftFilter,absences}){
         </tbody>
       </table>
     </div>
-    <ExportBar data={data} shiftFilter={shiftFilter} absences={absences} sortedRows={rows}/>
   </div>;
 }
 
